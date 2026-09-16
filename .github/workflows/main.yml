@@ -11,26 +11,36 @@ jobs:
     steps:
 
       # =========================================================
-      # 1. Configure Windows RDP
+      # 1. CONFIGURE WINDOWS RDP
       # =========================================================
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
+          Write-Host "Configuring Windows Remote Desktop..."
+
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
+            -Name "UserAuthentication" `
+            -Value 0 `
+            -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
+            -Name "SecurityLayer" `
+            -Value 0 `
+            -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "fDisableClip" -Value 0 -Force
+            -Name "fDisableClip" `
+            -Value 0 `
+            -Force
 
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
 
@@ -39,18 +49,22 @@ jobs:
             dir=in `
             action=allow `
             protocol=TCP `
-            localport=3389
+            localport=3389 `
+            remoteip=100.64.0.0/10 `
+            profile=any
 
           Restart-Service -Name TermService -Force
 
+          Write-Host "RDP configuration complete."
+
 
       # =========================================================
-      # 2. Create RDP User
+      # 2. CREATE RDP USER
       # =========================================================
-      - name: Create RDP User with Secure Password
+      - name: Create RDP User
         shell: powershell
         run: |
-          Add-Type -AssemblyName System.Security
+          Write-Host "Creating RDP user..."
 
           $charSet = @{
             Upper   = [char[]](65..90)
@@ -87,20 +101,19 @@ jobs:
 
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-          "::add-mask::$password"
-
-          if (-not (Get-LocalUser -Name "RDP")) {
-            Write-Error "User creation failed"
-            exit 1
-          }
+          Write-Host "RDP user created."
+          Write-Host "RDP Username: RDP"
+          Write-Host "RDP Password: $password"
 
 
       # =========================================================
-      # 3. Install Tailscale
+      # 3. INSTALL TAILSCALE
       # =========================================================
       - name: Install Tailscale
         shell: powershell
         run: |
+          Write-Host "Installing Tailscale..."
+
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
 
@@ -115,51 +128,61 @@ jobs:
 
           Remove-Item $installerPath -Force
 
+          Write-Host "Tailscale installed."
+
 
       # =========================================================
-      # 4. Connect Tailscale
+      # 4. CONNECT TO TAILSCALE
       # =========================================================
       - name: Establish Tailscale Connection
         shell: powershell
         run: |
+          Write-Host "Connecting to Tailscale..."
+
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
             --hostname=gh-runner-$env:GITHUB_RUN_ID
 
           $tsIP = $null
-          $retries = 0
 
-          while (-not $tsIP -and $retries -lt 10) {
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          for ($i = 1; $i -le 20; $i++) {
 
+            $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+
+            if ($tsIP) {
+              break
+            }
+
+            Write-Host "Waiting for Tailscale IP..."
             Start-Sleep -Seconds 5
-            $retries++
           }
 
           if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned."
+            Write-Error "Tailscale IP was not assigned."
             exit 1
           }
 
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
+          Write-Host "================================"
           Write-Host "Tailscale IP: $tsIP"
+          Write-Host "================================"
 
 
       # =========================================================
-      # 5. Verify RDP
+      # 5. TEST RDP
       # =========================================================
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
-          Write-Host "Testing RDP on $env:TAILSCALE_IP"
+          Write-Host "Testing RDP..."
 
           $testResult = Test-NetConnection `
             -ComputerName $env:TAILSCALE_IP `
             -Port 3389
 
           if (-not $testResult.TcpTestSucceeded) {
-            Write-Error "TCP connection to RDP failed."
+            Write-Error "RDP TCP connection failed."
             exit 1
           }
 
@@ -167,73 +190,108 @@ jobs:
 
 
       # =========================================================
-      # 6. Install RustDesk
+      # 6. DOWNLOAD RUSTDESK MSI
       # =========================================================
-      - name: Install RustDesk
+      - name: Download RustDesk MSI
         shell: powershell
         run: |
-
-          Write-Host "Finding latest RustDesk Windows release..."
+          Write-Host "Finding latest RustDesk release..."
 
           $release = Invoke-RestMethod `
             -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest" `
-            -Headers @{
-              "User-Agent" = "GitHub-Actions"
-            }
+            -Headers @{"User-Agent"="GitHub-Actions"}
+
+          Write-Host "RustDesk version: $($release.tag_name)"
 
           $asset = $release.assets |
             Where-Object {
-              $_.name -match "x86_64\.exe$"
+              $_.name -match "x86_64.*\.msi$"
             } |
             Select-Object -First 1
 
           if (-not $asset) {
-            Write-Error "Could not find RustDesk Windows x86_64 installer."
+            Write-Error "Could not find RustDesk x86_64 MSI."
             exit 1
           }
 
-          Write-Host "RustDesk version: $($release.tag_name)"
           Write-Host "Downloading: $($asset.name)"
 
-          $installer = "$env:TEMP\rustdesk.exe"
+          $rustdeskInstaller = "$env:TEMP\rustdesk.msi"
 
           Invoke-WebRequest `
             -Uri $asset.browser_download_url `
-            -OutFile $installer
+            -OutFile $rustdeskInstaller
 
-          Write-Host "Installing RustDesk..."
-
-          Start-Process `
-            -FilePath $installer `
-            -ArgumentList "--silent-install" `
-            -Wait
-
-          Start-Sleep -Seconds 15
-
-          $rustdesk = "C:\Program Files\RustDesk\rustdesk.exe"
-
-          if (-not (Test-Path $rustdesk)) {
-            Write-Error "RustDesk installation failed."
+          if (-not (Test-Path $rustdeskInstaller)) {
+            Write-Error "RustDesk MSI download failed."
             exit 1
           }
 
-          Write-Host "RustDesk installed successfully."
+          Write-Host "RustDesk MSI downloaded successfully."
 
 
       # =========================================================
-      # 7. Install and Start RustDesk Service
+      # 7. INSTALL RUSTDESK USING MSI
+      # =========================================================
+      - name: Install RustDesk
+        shell: powershell
+        run: |
+          Write-Host "Installing RustDesk using MSI..."
+
+          $installer = "$env:TEMP\rustdesk.msi"
+
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i", "`"$installer`"", "/qn", "/norestart", "INSTALLPRINTER=N" `
+            -Wait `
+            -PassThru
+
+          Write-Host "MSI exit code: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0) {
+            Write-Error "RustDesk MSI installation failed."
+            exit 1
+          }
+
+          $rustdesk = "C:\Program Files\RustDesk\rustdesk.exe"
+
+          for ($i = 1; $i -le 30; $i++) {
+
+            if (Test-Path $rustdesk) {
+              Write-Host "RustDesk installation detected."
+              break
+            }
+
+            Write-Host "Waiting for RustDesk installation..."
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not (Test-Path $rustdesk)) {
+            Write-Error "RustDesk executable was not found."
+            exit 1
+          }
+
+          Write-Host "================================"
+          Write-Host "RustDesk installed successfully!"
+          Write-Host "================================"
+
+
+      # =========================================================
+      # 8. INSTALL RUSTDESK SERVICE
       # =========================================================
       - name: Configure RustDesk Service
         shell: powershell
         run: |
-
           $rustdesk = "C:\Program Files\RustDesk\rustdesk.exe"
 
           Write-Host "Installing RustDesk service..."
 
-          & $rustdesk --install-service
+          Start-Process `
+            -FilePath $rustdesk `
+            -ArgumentList "--install-service" `
+            -Wait
 
-          Start-Sleep -Seconds 15
+          Start-Sleep -Seconds 20
 
           $service = Get-Service `
             -Name "RustDesk" `
@@ -249,16 +307,22 @@ jobs:
             Start-Sleep -Seconds 10
           }
 
+          $service.Refresh()
+
+          if ($service.Status -ne "Running") {
+            Write-Error "RustDesk service is not running."
+            exit 1
+          }
+
           Write-Host "RustDesk service is running."
 
 
       # =========================================================
-      # 8. Create RustDesk Password
+      # 9. CREATE RUSTDESK PASSWORD
       # =========================================================
       - name: Configure RustDesk Password
         shell: powershell
         run: |
-
           $rustdesk = "C:\Program Files\RustDesk\rustdesk.exe"
 
           $chars = (
@@ -275,84 +339,35 @@ jobs:
             }
           )
 
-          & $rustdesk --password $rdPassword
+          Write-Host "Setting RustDesk permanent password..."
+
+          Start-Process `
+            -FilePath $rustdesk `
+            -ArgumentList "--password", $rdPassword `
+            -Wait
+
+          Start-Sleep -Seconds 5
 
           echo "RUSTDESK_PASSWORD=$rdPassword" >> $env:GITHUB_ENV
 
-          "::add-mask::$rdPassword"
-
-          Write-Host "RustDesk permanent password configured."
+          Write-Host "RustDesk Password: $rdPassword"
 
 
       # =========================================================
-      # 9. Get RustDesk ID
+      # 10. GET RUSTDESK ID
       # =========================================================
       - name: Get RustDesk ID
         shell: powershell
         run: |
-
           $rustdesk = "C:\Program Files\RustDesk\rustdesk.exe"
+
+          Write-Host "Getting RustDesk ID..."
 
           Start-Sleep -Seconds 10
 
-          $rdID = (& $rustdesk --get-id).Trim()
+          $rdID = (
+            & $rustdesk --get-id |
+            Out-String
+          ).Trim()
 
-          if (-not $rdID) {
-            Write-Error "Could not obtain RustDesk ID."
-            exit 1
-          }
-
-          echo "RUSTDESK_ID=$rdID" >> $env:GITHUB_ENV
-
-          Write-Host "RustDesk ID: $rdID"
-
-
-      # =========================================================
-      # 10. Display Connection Information
-      # =========================================================
-      - name: Display Connection Information
-        shell: powershell
-        run: |
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "          RDP + RUSTDESK ACCESS"
-          Write-Host "=============================================="
-          Write-Host ""
-          Write-Host "RDP"
-          Write-Host "Address:  $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "RUSTDESK"
-          Write-Host "ID:       $env:RUSTDESK_ID"
-          Write-Host "Password: $env:RUSTDESK_PASSWORD"
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host ""
-
-
-      # =========================================================
-      # 11. Keep GitHub VM Running
-      # =========================================================
-      - name: Maintain Connection
-        shell: powershell
-        run: |
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host " RDP + RUSTDESK ARE ACTIVE"
-          Write-Host "=============================================="
-          Write-Host ""
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "RustDesk ID:  $env:RUSTDESK_ID"
-          Write-Host ""
-          Write-Host "Use your RDP app OR RustDesk Android app."
-          Write-Host ""
-
-          while ($true) {
-
-            Write-Host "[$(Get-Date)] RDP + RustDesk Active"
-
-            Start-Sleep -Seconds 300
-          }
+          if (-not $
